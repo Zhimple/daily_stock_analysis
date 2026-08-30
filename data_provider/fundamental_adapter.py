@@ -505,20 +505,23 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_financial_core(self, stock_code: str) -> Dict[str, Any]:
         """
-        Return normalized fundamental blocks from AkShare with partial tolerance.
+        财报核心块（快速、高价值）：财务指标（营收/净利/ROE/同比）+ 分红。
+
+        与 get_optional_fundamentals 分离，供 DataFetcherManager 以独立有界任务
+        执行：即使可选块（业绩预告/快报/机构持仓）因全市场表耗时超时，也不会
+        把本块已经取得的财报结构化数据整体拖成 timeout 丢弃。
         """
         result: Dict[str, Any] = {
             "status": "not_supported",
             "growth": {},
             "earnings": {},
-            "institution": {},
             "source_chain": [],
             "errors": [],
         }
 
-        # Financial indicators (竖排 stock_financial_abstract 优先，横排 indicator 兜底)
+        # 财务指标（竖排 stock_financial_abstract 优先，横排 indicator 兜底）
         start_year = str(max(1900, datetime.now().year - 1))
         fin_df, fin_source, fin_errors = self._call_df_candidates([
             ("stock_financial_abstract", {"symbol": stock_code}),
@@ -564,39 +567,7 @@ class AkshareFundamentalAdapter:
                         result["earnings"]["financial_report"] = financial_report_payload
                     result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast (当前 akshare 的 stock_yjyg_em/stock_yjbb_em 不再接受 symbol=，
-        # 改用 date= 传最近报告期；旧版本同样兼容 date= 关键字)
-        report_period = _recent_report_period()
-        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"date": report_period}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"date": report_period}),
-            ("stock_yjbb_em", {}),
-        ])
-        result["errors"].extend(forecast_errors)
-        if forecast_df is not None:
-            row = _extract_latest_row(forecast_df, stock_code)
-            if row is not None:
-                result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
-                )[:200]
-                result["source_chain"].append(f"earnings_forecast:{forecast_source}")
-
-        # Earnings quick report (同上，stock_yjkb_em 用 date= 报告期)
-        quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"date": report_period}),
-            ("stock_yjkb_em", {}),
-        ])
-        result["errors"].extend(quick_errors)
-        if quick_df is not None:
-            row = _extract_latest_row(quick_df, stock_code)
-            if row is not None:
-                result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
-                )[:200]
-                result["source_chain"].append(f"earnings_quick:{quick_source}")
-
-        # Dividend details (cash dividend, pre-tax)
+        # 分红明细（现金分红，税前）
         dividend_df, dividend_source, dividend_errors = self._call_df_candidates([
             ("stock_fhps_detail_em", {"symbol": stock_code}),
             ("stock_history_dividend_detail", {"symbol": stock_code, "indicator": "分红", "date": ""}),
@@ -609,7 +580,55 @@ class AkshareFundamentalAdapter:
                 result["earnings"]["dividend"] = dividend_payload
                 result["source_chain"].append(f"dividend:{dividend_source}")
 
-        # Institution / top shareholders
+        has_content = bool(result["growth"] or result["earnings"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_optional_fundamentals(self, stock_code: str) -> Dict[str, Any]:
+        """
+        可选增强块（慢，可独立超时丢弃）：业绩预告/快报、机构持仓/前十股东。
+
+        仅保留 date= 变体，去掉不带参数的 fallback（默认拉全市场旧表，慢且无效）。
+        """
+        result: Dict[str, Any] = {
+            "status": "not_supported",
+            "growth": {},
+            "earnings": {},
+            "institution": {},
+            "source_chain": [],
+            "errors": [],
+        }
+
+        # 业绩预告（当前 akshare 的 stock_yjyg_em/stock_yjbb_em 不再接受 symbol=，
+        # 改用 date= 传最近报告期；旧版本同样兼容 date= 关键字）
+        report_period = _recent_report_period()
+        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
+            ("stock_yjyg_em", {"date": report_period}),
+            ("stock_yjbb_em", {"date": report_period}),
+        ])
+        result["errors"].extend(forecast_errors)
+        if forecast_df is not None:
+            row = _extract_latest_row(forecast_df, stock_code)
+            if row is not None:
+                result["earnings"]["forecast_summary"] = _safe_str(
+                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
+                )[:200]
+                result["source_chain"].append(f"earnings_forecast:{forecast_source}")
+
+        # 业绩快报
+        quick_df, quick_source, quick_errors = self._call_df_candidates([
+            ("stock_yjkb_em", {"date": report_period}),
+        ])
+        result["errors"].extend(quick_errors)
+        if quick_df is not None:
+            row = _extract_latest_row(quick_df, stock_code)
+            if row is not None:
+                result["earnings"]["quick_report_summary"] = _safe_str(
+                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
+                )[:200]
+                result["source_chain"].append(f"earnings_quick:{quick_source}")
+
+        # 机构持仓 / 前十股东
         inst_df, inst_source, inst_errors = self._call_df_candidates([
             ("stock_institute_hold", {}),
             ("stock_institute_recommend", {}),
@@ -636,6 +655,30 @@ class AkshareFundamentalAdapter:
                 result["institution"]["top10_holder_change"] = holder_change
                 result["source_chain"].append(f"top10:{top10_source}")
 
+        has_content = bool(result["earnings"] or result["institution"])
+        result["status"] = "partial" if has_content else "not_supported"
+        return result
+
+    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+        """
+        Return normalized fundamental blocks from AkShare with partial tolerance.
+
+        Merges :meth:`get_financial_core` and :meth:`get_optional_fundamentals`;
+        kept for consumers that want a single aggregated bundle.
+        """
+        core = self.get_financial_core(stock_code)
+        optional = self.get_optional_fundamentals(stock_code)
+        earnings = dict(core.get("earnings", {}) or {})
+        earnings.update(optional.get("earnings", {}) or {})
+        result: Dict[str, Any] = {
+            "status": "partial",
+            "growth": dict(core.get("growth", {}) or {}),
+            "earnings": earnings,
+            "institution": dict(optional.get("institution", {}) or {}),
+            "source_chain": list(core.get("source_chain", []) or [])
+            + list(optional.get("source_chain", []) or []),
+            "errors": list(core.get("errors", []) or []) + list(optional.get("errors", []) or []),
+        }
         has_content = bool(result["growth"] or result["earnings"] or result["institution"])
         result["status"] = "partial" if has_content else "not_supported"
         return result

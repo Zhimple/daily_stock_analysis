@@ -111,9 +111,9 @@ class TestFundamentalAdapter(unittest.TestCase):
             "_call_df_candidates",
             side_effect=[
                 (fin_df, "stock_financial_abstract", []),
+                (dividend_df, "stock_fhps_detail_em", []),
                 (forecast_df, "stock_yjyg_em", []),
                 (quick_df, "stock_yjkb_em", []),
-                (dividend_df, "stock_fhps_detail_em", []),
                 (None, None, []),
                 (None, None, []),
             ],
@@ -254,6 +254,38 @@ class TestFundamentalAdapter(unittest.TestCase):
         val = _pick_by_keywords(row, ["分配方案", "分红方案", "实施方案", "派息方案", "方案", "预案", "方案说明", "现金分红比例"])
         self.assertEqual(val, "实施分配")
 
+    def test_financial_core_survives_when_optional_independent(self) -> None:
+        """财务核心与可选块解耦：核心成功即可产出财报表，不受可选块失败影响。"""
+        adapter = AkshareFundamentalAdapter()
+        fin_df = pd.DataFrame(
+            {
+                "选项": ["常用指标", "常用指标", "常用指标", "常用指标", "常用指标"],
+                "指标": ["归母净利润", "营业总收入", "净利润", "营业成本", "经营现金流量净额"],
+                "20260630": [1766269020.71, 7274643508.72, 1.0, 1.0, 1088989342.51],
+            }
+        )
+        dividend_df = pd.DataFrame(
+            {
+                "股票代码": ["600519"],
+                "除息日": ["2026-06-02"],
+                "分配方案": ["10派2.1元(含税)"],
+            }
+        )
+        with patch.object(
+            adapter,
+            "_call_df_candidates",
+            side_effect=[
+                (fin_df, "stock_financial_abstract", []),
+                (dividend_df, "stock_fhps_detail_em", []),
+            ],
+        ):
+            core = adapter.get_financial_core("600519")
+
+        report = core["earnings"].get("financial_report", {})
+        self.assertEqual(report.get("report_date"), "2026-06-30")
+        self.assertAlmostEqual(report.get("revenue"), 7274643508.72, places=2)
+        self.assertAlmostEqual(core["earnings"]["dividend"]["events"][0]["cash_dividend_per_share"], 0.21, places=6)
+
     def test_fundamental_bundle_vertical_abstract_end_to_end(self) -> None:
         adapter = AkshareFundamentalAdapter()
         fin_df = pd.DataFrame(
@@ -282,11 +314,11 @@ class TestFundamentalAdapter(unittest.TestCase):
             "_call_df_candidates",
             side_effect=[
                 (fin_df, "stock_financial_abstract", []),
+                (dividend_df, "stock_fhps_detail_em", []),
                 (None, None, []),  # forecast: unavailable
                 (None, None, []),  # quick report: unavailable
-                (dividend_df, "stock_fhps_detail_em", []),
-                (None, None, []),
-                (None, None, []),
+                (None, None, []),  # institution: unavailable
+                (None, None, []),  # top10: unavailable
             ],
         ):
             result = adapter.get_fundamental_bundle("002555")

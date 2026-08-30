@@ -4295,56 +4295,89 @@ class DataFetcherManager:
             [valuation_err] if valuation_err else [],
         )
 
-        # growth / earnings / institution (one AkShare call)
-        if remaining_seconds <= 0:
-            bundle_status = "failed"
-            bundle_payload: Dict[str, Any] = {}
-            bundle_errors = ["fundamental stage timeout"]
-            bundle_ms = 0
-        else:
-            bundle_timeout = min(fetch_timeout, remaining_seconds)
-            bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
-                bundle_timeout,
-                "fundamental_bundle",
+        # growth / earnings / institution —— 拆成两个独立出参的有界任务：
+        # 财报核心（财务指标+分红，快）优先跑完；可选增强（业绩预告/快报/机构，
+        # 常拉全市场表，慢）单独有界。任一超时都不会把另一路已取得的数据拖成
+        # timeout 丢弃 —— 修复此前单个 fundamental_bundle 超时导致财报表整体缺失。
+        core_payload: Dict[str, Any] = {}
+        core_err_msg: Optional[str] = None
+        core_ms = 0
+        if remaining_seconds > 0:
+            core_timeout = min(fetch_timeout, remaining_seconds)
+            core_payload, core_err_msg, core_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_financial_core(stock_code),
+                core_timeout,
+                "fundamental_financial_core",
             )
-            _consume_budget(bundle_ms)
-            if not isinstance(bundle_payload, dict):
-                bundle_status = "failed"
-                bundle_payload = {}
-                bundle_errors = ["fundamental_bundle failed"]
-                if bundle_err_msg:
-                    bundle_errors.append(bundle_err_msg)
-            else:
-                bundle_status = str(bundle_payload.get("status", "not_supported"))
-                bundle_errors = [bundle_err_msg] if bundle_err_msg else []
+            _consume_budget(core_ms)
+        if not isinstance(core_payload, dict):
+            core_payload = {}
+            bundle_status = "failed"
+            bundle_errors = [core_err_msg or "fundamental_financial_core failed"]
+        else:
+            bundle_status = str(core_payload.get("status", "not_supported"))
+            bundle_errors = [core_err_msg] if core_err_msg else []
 
+        opt_payload: Dict[str, Any] = {}
+        opt_err_msg: Optional[str] = None
+        opt_ms = 0
+        if remaining_seconds > 0:
+            opt_timeout = min(fetch_timeout, remaining_seconds)
+            opt_payload, opt_err_msg, opt_ms = self._run_with_retry(
+                lambda: self._fundamental_adapter.get_optional_fundamentals(stock_code),
+                opt_timeout,
+                "fundamental_optional",
+            )
+            _consume_budget(opt_ms)
+        if not isinstance(opt_payload, dict):
+            opt_errors = [opt_err_msg or "fundamental_optional failed"]
+        else:
+            opt_errors = [opt_err_msg] if opt_err_msg else []
+
+        bundle_ms = core_ms + opt_ms
+        core_chain = (
+            list(core_payload.get("source_chain", []))
+            if isinstance(core_payload.get("source_chain", []), list)
+            else []
+        )
+        opt_chain = (
+            list(opt_payload.get("source_chain", []))
+            if isinstance(opt_payload.get("source_chain", []), list)
+            else []
+        )
         bundle_chain = self._normalize_source_chain(
-            bundle_payload.get("source_chain", []),
-            "fundamental_bundle",
-            bundle_status,
-            bundle_ms,
-        ) if isinstance(bundle_payload, dict) else self._normalize_source_chain(
-            None,
+            core_chain + opt_chain,
             "fundamental_bundle",
             bundle_status,
             bundle_ms,
         )
-        growth_payload = bundle_payload.get("growth", {}) if isinstance(bundle_payload, dict) else {}
-        earnings_payload = bundle_payload.get("earnings", {}) if isinstance(bundle_payload, dict) else {}
-        institution_payload = bundle_payload.get("institution", {}) if isinstance(bundle_payload, dict) else {}
-        if not isinstance(growth_payload, dict):
-            growth_payload = {}
-        else:
-            growth_payload = dict(growth_payload)
-        if not isinstance(earnings_payload, dict):
-            earnings_payload = {}
-        else:
-            earnings_payload = dict(earnings_payload)
-        if not isinstance(institution_payload, dict):
-            institution_payload = {}
-        else:
-            institution_payload = dict(institution_payload)
+        growth_payload = (
+            dict(core_payload.get("growth", {}) or {})
+            if isinstance(core_payload.get("growth"), dict)
+            else {}
+        )
+        core_earnings = (
+            dict(core_payload.get("earnings", {}) or {})
+            if isinstance(core_payload.get("earnings"), dict)
+            else {}
+        )
+        opt_earnings = (
+            dict(opt_payload.get("earnings", {}) or {})
+            if isinstance(opt_payload.get("earnings"), dict)
+            else {}
+        )
+        earnings_payload = {**core_earnings, **opt_earnings}
+        institution_payload = (
+            dict(opt_payload.get("institution", {}) or {})
+            if isinstance(opt_payload.get("institution"), dict)
+            else {}
+        )
+        adapter_errors = (
+            list(core_payload.get("errors", []) or [])
+            + list(bundle_errors)
+            + list(opt_payload.get("errors", []) or [])
+            + list(opt_errors)
+        )
 
         # Derive TTM dividend yield from already-fetched quote price; avoid extra quote calls.
         earnings_extra_errors: List[str] = []
@@ -4380,8 +4413,6 @@ class DataFetcherManager:
                 dividend_payload["yield_formula"] = "ttm_cash_dividend_per_share / latest_price * 100"
             earnings_payload["dividend"] = dividend_payload
 
-        adapter_errors = list(bundle_payload.get("errors", [])) if isinstance(bundle_payload, dict) else []
-        adapter_errors.extend(bundle_errors)
         growth_errors = list(adapter_errors)
         earnings_errors = list(adapter_errors)
         earnings_errors.extend(earnings_extra_errors)

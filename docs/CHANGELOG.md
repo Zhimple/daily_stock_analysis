@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] A 股基本面聚合拆分为"财报核心（财务指标+分红）"与"可选增强（业绩预告/快报/机构持仓）"两个独立有界任务，可选块的全市场表耗时不再拖垮财报核心，修复真实流水线里 `fundamental_bundle timeout` 导致财报表整体缺失的问题。
+- [改进] 基本面阶段总预算默认从 8s 放宽到 18s、单能力源调用超时默认从 8s 放宽到 12s（`FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` / `FUNDAMENTAL_FETCH_TIMEOUT_SECONDS`），为东财慢接口留出余量。
 - [修复] A 股财报结构化适配 AkShare `stock_financial_abstract` 竖排布局（一行一指标、列为报告期），修复此前解析方向错误导致"财报结构化数据缺失"的问题，财报（报告期/营收/归母净利/经营现金流/ROE）与同比（营收/净利 YOY）现已可获取。
 - [修复] 业绩预告 `stock_yjyg_em`/`stock_yjbb_em` 与业绩快报 `stock_yjkb_em` 改用 `date=` 报告期参数，兼容最新 AkShare 签名（不再因 `symbol=` 不存在而必败）。
 - [修复] 东财分红送配明细支持"每10股派X元"比例列与"10送X派Y"文本解析，除权除息日/现金分红（税前）元数据现已可提取。
