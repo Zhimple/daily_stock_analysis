@@ -36,6 +36,9 @@ _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
         "方案",
         "预案",
         "方案说明",
+        # Eastmoney 分红送配明细的文本列（如 "现金分红-现金分红比例描述"）；
+        # 放在末位，避免遮蔽带"方案"关键词的真实方案列。
+        "现金分红比例",
     ],
     "ex_dividend_date": ["除权除息日", "除息日", "除权日", "除权除息", "除息日期"],
     "record_date": ["股权登记日", "登记日"],
@@ -94,13 +97,25 @@ def _normalize_code(raw: Any) -> str:
 def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
     """
     Return first non-empty row value whose column name contains any keyword.
+
+    ``pd.isna`` keeps pandas-native empties (None/NaN/NaT) from being returned as
+    text, e.g. ``预案公告日 = NaT`` must not shadow the next matching column.
     """
     for col in row.index:
         col_s = str(col)
         if any(k in col_s for k in keywords):
             val = row.get(col)
-            if val is not None and str(val).strip() not in ("", "-", "nan", "None"):
-                return val
+            if val is None:
+                continue
+            try:
+                if pd.isna(val):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            s = str(val).strip()
+            if s in ("", "-", "nan", "NaN", "NaT", "None", "null"):
+                continue
+            return val
     return None
 
 
@@ -113,6 +128,9 @@ def _parse_dividend_plan_to_per_share(plan_text: str) -> Optional[float]:
     for pattern in (
         r"(?:每)?\s*10\s*股?\s*派(?:发)?\s*([0-9]+(?:\.[0-9]+)?)\s*元",
         r"10\s*派\s*([0-9]+(?:\.[0-9]+)?)\s*元",
+        # 送转夹在中间： "10送10.00派2.00元(含税)"
+        r"10\s*(?:送|转)[^派]*派\s*([0-9]+(?:\.[0-9]+)?)\s*元",
+        r"10\s*派\s*([0-9]+(?:\.[0-9]+)?)\s*元(?:\s*含税)?",
     ):
         match = re.search(pattern, text)
         if match:
@@ -128,6 +146,24 @@ def _parse_dividend_plan_to_per_share(plan_text: str) -> Optional[float]:
     return None
 
 
+def _pick_cash_dividend_ratio_per_10(row: pd.Series) -> Optional[float]:
+    """Cash dividend expressed as per-10-shares amount from Eastmoney detail.
+
+    Matches numeric columns like ``现金分红-现金分红比例`` (value 2.0 means
+    "10派2元") while skipping text/derived siblings (描述/股息率/说明).
+    """
+    for col in row.index:
+        col_s = str(col)
+        if "现金分红-现金分红比例" not in col_s:
+            continue
+        if any(k in col_s for k in ("描述", "股息率", "说明")):
+            continue
+        val = _safe_float(row.get(col))
+        if val is not None and val > 0:
+            return val
+    return None
+
+
 def _extract_cash_dividend_per_share(row: pd.Series) -> Optional[float]:
     """Extract pre-tax cash dividend per share from a row."""
     plan_text = _safe_str(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["plan_text"]))
@@ -138,7 +174,187 @@ def _extract_cash_dividend_per_share(row: pd.Series) -> Optional[float]:
     direct = _safe_float(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["per_share"]))
     if direct is not None and direct > 0:
         return direct
+
+    # Eastmoney 分红送配明细将金额记作"每10股派现X元"，需除以10。
+    per_10 = _pick_cash_dividend_ratio_per_10(row)
+    if per_10 is not None:
+        return round(per_10 / 10.0, 6)
+
     return _parse_dividend_plan_to_per_share(plan_text)
+
+
+# ---------------------------------------------------------------------------
+# 竖排财报布局解析（stock_financial_abstract / 部分旧版接口返回"一行一指标"）
+# 每行是一个指标（指标列），列头是报告期（如 20260630，最新的在左侧）。
+# ---------------------------------------------------------------------------
+
+_VERTICAL_PERIOD_RE = re.compile(r"^\d{6,8}$")
+
+
+def _find_metric_column(df: pd.DataFrame) -> Optional[str]:
+    for col in df.columns:
+        if any(k in str(col) for k in ("指标", "指标名称", "财务指标")):
+            return col
+    return None
+
+
+def _is_vertical_layout(df: pd.DataFrame) -> bool:
+    """True when rows hold metric names and columns hold report periods."""
+    return _find_metric_column(df) is not None and any(
+        _VERTICAL_PERIOD_RE.match(str(c)) for c in df.columns
+    )
+
+
+def _period_columns_of(df: pd.DataFrame) -> List[str]:
+    return [str(c) for c in df.columns if _VERTICAL_PERIOD_RE.match(str(c))]
+
+
+def _computed_yoy(
+    df: pd.DataFrame,
+    metric_col: str,
+    metric_keyword: str,
+    report_date: Optional[str],
+) -> Optional[float]:
+    """Fallback YoY (%) computed from absolute values at the same period last year."""
+    if not report_date:
+        return None
+    row = None
+    for idx in df.index:
+        if metric_keyword in str(df.at[idx, metric_col]):
+            row = df.loc[idx]
+            break
+    if row is None:
+        return None
+    try:
+        prev_period = str(int(report_date[:4]) - 1) + report_date[4:]
+    except (TypeError, ValueError):
+        return None
+    if prev_period == report_date or prev_period not in _period_columns_of(df):
+        return None
+    cur = _safe_float(row.get(report_date))
+    prev = _safe_float(row.get(prev_period))
+    if cur is None or prev is None or prev == 0:
+        return None
+    return round((cur / prev - 1.0) * 100.0, 2)
+
+
+def _extract_financial_abstract(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Parse AkShare ``stock_financial_abstract`` vertical layout.
+
+    Returns ``{"growth": {...}, "financial_report": {...}}`` or ``{}`` when the
+    layout is unusable. Each metric may appear in several option groups; the
+    first matching row (常用指标 preferred for absolute values) wins.
+    """
+    metric_col = _find_metric_column(df)
+    if metric_col is None:
+        return {}
+    period_cols = _period_columns_of(df)
+    if not period_cols:
+        return {}
+    sorted_periods = sorted(period_cols, reverse=True)
+    has_option = "选项" in [str(c) for c in df.columns]
+
+    def find_row(*keywords: str, option: Optional[str] = None) -> Optional[pd.Series]:
+        matches: List[pd.Series] = []
+        for idx in df.index:
+            mname = str(df.at[idx, metric_col])
+            if any(mname == k or (k in mname) for k in keywords):
+                matches.append(df.loc[idx])
+        if not matches:
+            return None
+        if option and has_option:
+            for r in matches:
+                if str(r.get("选项", "")).strip() == option:
+                    return r
+        return matches[0]
+
+    def first_row(*keyword_groups: Tuple[str, ...], option: Optional[str] = None) -> Optional[pd.Series]:
+        for keywords in keyword_groups:
+            r = find_row(*keywords, option=option)
+            if r is not None:
+                return r
+        return None
+
+    rev_row = first_row(("营业总收入",), ("营业收入",), option="常用指标")
+    profit_row = first_row(("归母净利润",), ("净利润",), option="常用指标")
+    cf_row = first_row(("经营现金流量净额",), ("经营活动产生的现金流量净额",), option="常用指标")
+    roe_row = find_row("净资产收益率", option="常用指标")
+    gm_row = first_row(("毛利率",), ("销售毛利率",), option="常用指标")
+    rev_yoy_row = find_row("营业总收入增长率")
+    profit_yoy_row = find_row("归属母公司净利润增长率")
+
+    def latest_value(row: Optional[pd.Series]) -> Tuple[Optional[Any], Optional[str]]:
+        if row is None:
+            return None, None
+        for p in sorted_periods:
+            v = row.get(p)
+            if v is None:
+                continue
+            try:
+                if pd.isna(v):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            s = str(v).strip()
+            if s in ("", "-", "nan", "NaN", "NaT", "None", "null"):
+                continue
+            return v, p
+        return None, None
+
+    revenue, rev_period = latest_value(rev_row)
+    net_profit_parent, _ = latest_value(profit_row)
+    operating_cash_flow, _ = latest_value(cf_row)
+    roe, _ = latest_value(roe_row)
+    gross_margin, _ = latest_value(gm_row)
+    revenue_yoy, _ = latest_value(rev_yoy_row)
+    net_profit_yoy, _ = latest_value(profit_yoy_row)
+
+    report_date = rev_period
+    if not report_date:
+        for row in (profit_row, rev_row):
+            _, p = latest_value(row)
+            if p:
+                report_date = p
+                break
+
+    if revenue is None and net_profit_parent is None:
+        # Nothing meaningful in the preferred rows; treat as unusable.
+        return {}
+
+    if revenue_yoy is None:
+        revenue_yoy = _computed_yoy(df, metric_col, "营业总收入", report_date)
+    if net_profit_yoy is None:
+        net_profit_yoy = _computed_yoy(df, metric_col, "归母净利润", report_date)
+
+    return {
+        "growth": {
+            "revenue_yoy": _safe_float(revenue_yoy),
+            "net_profit_yoy": _safe_float(net_profit_yoy),
+            "roe": _safe_float(roe),
+            "gross_margin": _safe_float(gross_margin),
+        },
+        "financial_report": {
+            "report_date": _normalize_report_date(report_date) if report_date else None,
+            "revenue": _safe_float(revenue),
+            "net_profit_parent": _safe_float(net_profit_parent),
+            "operating_cash_flow": _safe_float(operating_cash_flow),
+            "roe": _safe_float(roe),
+        },
+    }
+
+
+def _recent_report_period() -> str:
+    """Latest quarter-end report period, e.g. 2026-08-30 -> '20260630'."""
+    today = datetime.now()
+    y, m = today.year, today.month
+    if m >= 10:
+        return f"{y}0930"
+    if m >= 7:
+        return f"{y}0630"
+    if m >= 4:
+        return f"{y}0331"
+    return f"{y - 1}1231"
 
 
 def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -302,48 +518,59 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        # Financial indicators
+        # Financial indicators (竖排 stock_financial_abstract 优先，横排 indicator 兜底)
+        start_year = str(max(1900, datetime.now().year - 1))
         fin_df, fin_source, fin_errors = self._call_df_candidates([
             ("stock_financial_abstract", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {}),
+            ("stock_financial_analysis_indicator", {"symbol": stock_code, "start_year": start_year}),
         ])
         result["errors"].extend(fin_errors)
         if fin_df is not None:
-            row = _extract_latest_row(fin_df, stock_code)
-            if row is not None:
-                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
-                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
-                roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
-                gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
-                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]))
-                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
-                net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
-                operating_cash_flow = _safe_float(
-                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
-                )
-                result["growth"] = {
-                    "revenue_yoy": revenue_yoy,
-                    "net_profit_yoy": profit_yoy,
-                    "roe": roe,
-                    "gross_margin": gross_margin,
-                }
-                financial_report_payload = {
-                    "report_date": report_date,
-                    "revenue": revenue,
-                    "net_profit_parent": net_profit_parent,
-                    "operating_cash_flow": operating_cash_flow,
-                    "roe": roe,
-                }
-                if any(v is not None for v in financial_report_payload.values()):
-                    result["earnings"]["financial_report"] = financial_report_payload
-                result["source_chain"].append(f"growth:{fin_source}")
+            if _is_vertical_layout(fin_df):
+                abstract = _extract_financial_abstract(fin_df)
+                if abstract:
+                    result["growth"] = dict(abstract.get("growth", {}))
+                    financial_report_payload = dict(abstract.get("financial_report", {}))
+                    if any(v is not None for v in financial_report_payload.values()):
+                        result["earnings"]["financial_report"] = financial_report_payload
+                    result["source_chain"].append(f"growth:{fin_source}")
+            else:
+                row = _extract_latest_row(fin_df, stock_code)
+                if row is not None:
+                    revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
+                    profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
+                    roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
+                    gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
+                    report_date = _normalize_report_date(_pick_by_keywords(row, ["报告期", "报告日期", "日期"]))
+                    revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
+                    net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
+                    operating_cash_flow = _safe_float(
+                        _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
+                    )
+                    result["growth"] = {
+                        "revenue_yoy": revenue_yoy,
+                        "net_profit_yoy": profit_yoy,
+                        "roe": roe,
+                        "gross_margin": gross_margin,
+                    }
+                    financial_report_payload = {
+                        "report_date": report_date,
+                        "revenue": revenue,
+                        "net_profit_parent": net_profit_parent,
+                        "operating_cash_flow": operating_cash_flow,
+                        "roe": roe,
+                    }
+                    if any(v is not None for v in financial_report_payload.values()):
+                        result["earnings"]["financial_report"] = financial_report_payload
+                    result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast
+        # Earnings forecast (当前 akshare 的 stock_yjyg_em/stock_yjbb_em 不再接受 symbol=，
+        # 改用 date= 传最近报告期；旧版本同样兼容 date= 关键字)
+        report_period = _recent_report_period()
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
+            ("stock_yjyg_em", {"date": report_period}),
             ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
+            ("stock_yjbb_em", {"date": report_period}),
             ("stock_yjbb_em", {}),
         ])
         result["errors"].extend(forecast_errors)
@@ -355,9 +582,9 @@ class AkshareFundamentalAdapter:
                 )[:200]
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
-        # Earnings quick report
+        # Earnings quick report (同上，stock_yjkb_em 用 date= 报告期)
         quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
+            ("stock_yjkb_em", {"date": report_period}),
             ("stock_yjkb_em", {}),
         ])
         result["errors"].extend(quick_errors)

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] A 股财报结构化适配 AkShare `stock_financial_abstract` 竖排布局（一行一指标、列为报告期），修复此前解析方向错误导致"财报结构化数据缺失"的问题，财报（报告期/营收/归母净利/经营现金流/ROE）与同比（营收/净利 YOY）现已可获取。
+- [修复] 业绩预告 `stock_yjyg_em`/`stock_yjbb_em` 与业绩快报 `stock_yjkb_em` 改用 `date=` 报告期参数，兼容最新 AkShare 签名（不再因 `symbol=` 不存在而必败）。
+- [修复] 东财分红送配明细支持"每10股派X元"比例列与"10送X派Y"文本解析，除权除息日/现金分红（税前）元数据现已可提取。
 - [修复] 美股日线路由现按各数据源当前优先级排序，单项 `*_PRIORITY` 配置（如 `YFINANCE_PRIORITY=0`）对美股即时生效；指数固定首选与 Longbridge preferred 语义保持不变
 
 - [新功能] 支持通过 `main.py --stocks` 一次性分析已登记板块指数，自动使用指数适用的数据与分析能力，并保持报告、历史和决策信号兼容。
